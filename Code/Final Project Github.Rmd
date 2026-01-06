@@ -1,0 +1,557 @@
+---
+title: "College Football Spread Modeling"
+author: "Lance Pollack"
+date: "2024-12-09"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+
+library(tidyverse)
+library(caret)
+library(glmnet)
+library(rpart)
+library(rpart.plot)
+library(xgboost)
+library(kernlab)
+library(fields) # for image.plot
+```
+
+## Parameters
+
+```{r parameters, echo=TRUE}
+# Key control for alternate line; all downstream scores and labels depend on this.
+alt_line <- -7
+```
+
+## Helper Functions
+
+```{r helper-functions}
+odds_to_prob <- function(plus_odds, minus_odds, book = "House") {
+  plus_prob <- 100 / (plus_odds + 100)
+  minus_prob <- abs(minus_odds) / (abs(minus_odds) + 100)
+  prob_sum <- plus_prob + minus_prob
+
+  c(
+    plus_prob_actual = 100 * plus_prob / prob_sum,
+    minus_prob_actual = 100 * minus_prob / prob_sum
+  )
+}
+
+prob_to_odds <- function(low_prob, high_prob, house_edge = 0.06) {
+  if (house_edge >= 1) {
+    house_edge <- house_edge / 100
+  }
+  high_prob <- ifelse(high_prob > 0.94 & high_prob <= 1, 0.94, high_prob)
+
+  low_prob <- low_prob * (1 + house_edge)
+  high_prob <- high_prob * (1 + house_edge)
+
+  low_prob  <- ifelse(low_prob > 1,  low_prob / 100,  low_prob)
+  high_prob <- ifelse(high_prob > 1, high_prob / 100, high_prob)
+
+  plus_odds <- round(100 * ((1 - low_prob) / low_prob))
+  minus_odds <- round(-100 * (high_prob / (1 - high_prob)))
+
+  cbind(plus_odds = plus_odds, minus_odds = minus_odds)
+}
+
+compute_score_multiplier <- function(simulated_data, alt_line) {
+  alt_line_prob <- mean(simulated_data > alt_line)
+  alt_line_odds <- prob_to_odds(alt_line_prob, 1 - alt_line_prob)
+  alt_line_odds[, "plus_odds"] / 100
+}
+
+bootstrap_score_multiplier <- function(n, mean_val, sd_val, alt_line, reps = 1000, seed = 123) {
+  set.seed(seed)
+  sims <- replicate(
+    reps,
+    compute_score_multiplier(
+      simulated_data = rnorm(n = n, mean = mean_val, sd = sd_val),
+      alt_line = alt_line
+    )
+  )
+
+  list(
+    mean = mean(sims),
+    lower = quantile(sims, 0.05),
+    upper = quantile(sims, 0.95),
+    sd = sd(sims),
+    draws = sims
+  )
+}
+
+get_score <- function(probs, true_label, score_multiplier, threshold = 0.5) {
+  true_label <- ifelse(true_label == "Yes", 1, 0)
+  pred_label <- ifelse(probs > threshold, 1, 0)
+  correct <- sum(true_label == 1 & pred_label == 1)
+  incorrect <- sum(true_label == 0 & pred_label == 1)
+  (score_multiplier * correct) + (-1 * incorrect)
+}
+```
+
+## Load Data
+
+```{r load-data}
+resolve_data_path <- function(filename) {
+  candidates <- c(
+    file.path("data", filename),
+    file.path("Data", filename),
+    file.path("Final Project", "Data", filename),
+    file.path("..", "data", filename),
+    file.path("..", "Data", filename),
+    file.path("Final Project", filename),
+    file.path("..", "Final Project", "Data", filename),
+  )
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) == 0) {
+    stop(paste("Place", filename, "in a data/ folder in this repo."))
+  }
+  existing[1]
+}
+
+data_base <- read.csv(resolve_data_path("07_21_2024_CFD_attributes.csv"))
+data_l5 <- read.csv(resolve_data_path("08_18_2024_CFD_attributes_last5.csv"))
+
+dim(data_base)
+dim(data_l5)
+sort(unique(data_base$week))
+sort(unique(data_l5$week))
+```
+
+## Feature Engineering
+
+```{r feature-engineering}
+cover_mean <- mean(data_base$home_covering_spread)
+cover_sd <- sd(data_base$home_covering_spread)
+
+data <- data_base %>%
+  filter(week > 5) %>%
+  mutate(
+    home_alt_cover_label = ifelse(home_covering_spread > alt_line, 1, 0),
+    away_alt_cover_label = ifelse(-1 * home_covering_spread > alt_line, 1, 0),
+    temp_covering_line = ifelse(home_covering_spread > 24, 24, home_covering_spread),
+    home_bet_return = ifelse(
+      temp_covering_line > 0,
+      prob_to_odds(
+        1 - pnorm(temp_covering_line - 1, mean = cover_mean, sd = cover_sd),
+        pnorm(temp_covering_line - 1, mean = cover_mean, sd = cover_sd)
+      )[,"plus_odds"],
+      ifelse(temp_covering_line < 0, -100, 0)
+    )
+  )
+
+data[, 92:100]
+dim(data)
+```
+
+## Distribution Check
+
+```{r distribution-check}
+ks.test(data_base$home_covering_spread, "pnorm", mean = cover_mean, sd = cover_sd)
+qqnorm(data_base$home_covering_spread)
+qqline(data_base$home_covering_spread, col = "red")
+
+hist(
+  data$home_covering_spread,
+  breaks = 30,
+  probability = TRUE,
+  main = "Distribution of Covering of Spread",
+  xlab = "Home Covering of Spread"
+)
+curve(
+  dnorm(x, mean = mean(data$home_covering_spread), sd = sd(data$home_covering_spread)),
+  add = TRUE,
+  col = "red",
+  lwd = 2,
+  from = min(data$home_covering_spread),
+  to = max(data$home_covering_spread)
+)
+```
+
+## Score Multiplier via Parametric Bootstrap
+
+```{r score-multiplier}
+sm <- bootstrap_score_multiplier(
+  n = length(data_base$home_covering_spread),
+  mean_val = cover_mean,
+  sd_val = cover_sd,
+  alt_line = alt_line,
+  reps = 1000,
+  seed = 123
+)
+
+sm$mean
+
+hist(
+  sm$draws,
+  breaks = 30,
+  probability = TRUE,
+  main = "Parametric Bootstrap Score Multiplier (Normal)",
+  xlab = "Score Multiplier"
+)
+lines(density(sm$draws), col = "red", lwd = 2)
+abline(v = sm$mean, col = "purple", lwd = 2)
+abline(v = sm$lower, col = "green", lwd = 2, lty = 2)
+abline(v = sm$upper, col = "green", lwd = 2, lty = 2)
+curve(
+  dnorm(x, mean = sm$mean, sd = sm$sd),
+  add = TRUE,
+  col = "blue",
+  lwd = 2,
+  lty = 3
+)
+legend(
+  "topright",
+  legend = c("KDE", "Mean", "95% CI", "Normal"),
+  col = c("red", "purple", "green", "blue"),
+  lwd = 2,
+  lty = c(1, 1, 2, 3)
+)
+```
+
+## Modeling Data Prep
+
+```{r modeling-prep}
+data$neutral_site <- as.integer(as.logical(data$neutral_site))
+data$conference_game <- as.integer(as.logical(data$conference_game))
+
+id_cols <- c(
+  "id", "season", "week", "home_team", "away_team",
+  "home_conference", "away_conference", "venue_id"
+)
+
+data_model <- data %>%
+  select(-all_of(id_cols))
+
+X_temp <- data_model %>%
+  select(-all_of(c(
+    "home_winner_label", "home_score", "away_score", "spread",
+    "home_covering_spread", "home_cover_label", "home_alt_cover_label",
+    "away_alt_cover_label", "temp_covering_line", "home_bet_return"
+  )))
+
+X_temp[] <- scale(X_temp[])
+dim(X_temp)
+```
+
+```{r correlation-filter}
+cor_matrix <- cor(X_temp)
+image.plot(cor_matrix, main = "Correlation Heatmap")
+
+high_corr <- findCorrelation(cor_matrix, cutoff = 0.8)
+X <- X_temp[, -high_corr]
+dim(X)
+```
+
+## Train / Test Split and Scoring Setup
+
+```{r train-test-setup}
+season <- data$season
+Y_bin <- data_model$away_alt_cover_label
+
+percentile <- seq(0, 1, by = 0.05)
+
+scoreSummary <- function(data, lev = NULL, model = NULL) {
+  data$obs <- ifelse(data$obs == "Yes", 1, 0)
+  data$pred <- ifelse(data$pred == "Yes", 1, 0)
+  correct <- sum(data$obs == 1 & data$pred == 1)
+  incorrect <- sum(data$obs == 0 & data$pred == 1)
+  score <- (sm$mean * correct) + (-1 * incorrect)
+  c(Score = score)
+}
+
+ctrl <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 1,
+  summaryFunction = scoreSummary,
+  classProbs = TRUE,
+  savePredictions = TRUE
+)
+
+train_index <- which(season < 2020)
+X_train <- X[train_index, ]
+Y_train <- Y_bin[train_index]
+
+X_test <- X[-train_index, ]
+Y_test <- Y_bin[-train_index]
+
+train_data <- cbind(X_train, target = factor(Y_train, levels = c(0, 1), labels = c("No", "Yes")))
+test_data <- cbind(X_test, target = factor(Y_test, levels = c(0, 1), labels = c("No", "Yes")))
+
+dim(train_data)
+dim(test_data)
+```
+
+## Baseline Models: Logistic + GLMNet
+
+```{r logistic-glmnet, warning=FALSE}
+set.seed(123)
+model_glm <- train(
+  target ~ .,
+  data = train_data,
+  method = "glm",
+  family = "binomial",
+  metric = "Score",
+  trControl = ctrl
+)
+model_glm$bestTune
+
+set.seed(123)
+model_glmnet <- train(
+  target ~ .,
+  data = train_data,
+  method = "glmnet",
+  metric = "Score",
+  trControl = ctrl,
+  tuneLength = 5
+)
+model_glmnet$bestTune
+```
+
+## Regularized Models: Lasso + Ridge
+
+```{r lasso-ridge, warning=FALSE}
+tune_grid_lasso <- expand.grid(
+  alpha = 1,
+  lambda = c(0.0001, 0.001, 0.01, 0.1, 1, 10, 30, 50)
+)
+
+tune_grid_ridge <- expand.grid(
+  alpha = 0,
+  lambda = c(0.0001, 0.001, 0.01, 0.1, 1, 10, 30, 50)
+)
+
+set.seed(123)
+lasso_model <- train(
+  target ~ .,
+  data = train_data,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = tune_grid_lasso,
+  metric = "Score"
+)
+lasso_model$bestTune
+
+set.seed(123)
+ridge_model <- train(
+  target ~ .,
+  data = train_data,
+  method = "glmnet",
+  trControl = ctrl,
+  tuneGrid = tune_grid_ridge,
+  metric = "Score"
+)
+ridge_model$bestTune
+```
+
+## Linear Discriminant, Quadratic Discriminant, and KNN
+
+```{r lda-qda-knn, warning=FALSE}
+set.seed(123)
+model_lda <- train(
+  target ~ .,
+  data = train_data,
+  method = "lda",
+  metric = "Score",
+  trControl = ctrl
+)
+
+set.seed(123)
+model_qda <- train(
+  target ~ .,
+  data = train_data,
+  method = "qda",
+  metric = "Score",
+  trControl = ctrl
+)
+
+set.seed(123)
+model_knn <- train(
+  target ~ .,
+  data = train_data,
+  method = "knn",
+  metric = "Score",
+  trControl = ctrl,
+  tuneLength = 10
+)
+
+model_lda$bestTune
+model_qda$bestTune
+model_knn$bestTune
+```
+
+## Support Vector Machines
+
+```{r svm, warning=FALSE}
+ctrl_svm <- trainControl(
+  method = "repeatedcv",
+  number = 10,
+  repeats = 1,
+  summaryFunction = scoreSummary,
+  classProbs = TRUE,
+  savePredictions = TRUE
+)
+
+set.seed(123)
+model_svm_linear <- train(
+  target ~ .,
+  data = train_data,
+  method = "svmLinear",
+  metric = "Score",
+  trControl = ctrl_svm,
+  preProcess = c("center", "scale"),
+  tuneLength = 5
+)
+model_svm_linear$bestTune
+```
+
+## Tree-Based Models
+
+```{r tree-xgb, warning=FALSE}
+set.seed(123)
+model_tree <- train(
+  target ~ .,
+  data = train_data,
+  method = "rpart",
+  metric = "Score",
+  trControl = ctrl,
+  tuneLength = 10
+)
+model_tree$bestTune
+rpart.plot(model_tree$finalModel)
+
+set.seed(123)
+model_xgb <- train(
+  target ~ .,
+  data = train_data,
+  method = "xgbTree",
+  trControl = ctrl,
+  metric = "Score",
+  tuneLength = 1,
+  verbose = FALSE,
+  verbosity = 0
+)
+```
+
+## Dimension Reduction Model
+
+```{r pls, warning=FALSE}
+set.seed(123)
+model_pls <- train(
+  target ~ .,
+  data = train_data,
+  method = "pls",
+  metric = "Score",
+  trControl = ctrl,
+  tuneLength = 1
+)
+```
+
+## Collect Probabilities
+
+```{r collect-probabilities}
+model_probs <- list(
+  Logistic = predict(model_glm, newdata = test_data, type = "prob")[, "Yes"],
+  GLMNet = predict(model_glmnet, newdata = test_data, type = "prob")[, "Yes"],
+  Lasso = predict(lasso_model, newdata = test_data, type = "prob")[, "Yes"],
+  Ridge = predict(ridge_model, newdata = test_data, type = "prob")[, "Yes"],
+  LDA = predict(model_lda, newdata = test_data, type = "prob")[, "Yes"],
+  QDA = predict(model_qda, newdata = test_data, type = "prob")[, "Yes"],
+  KNN = predict(model_knn, newdata = test_data, type = "prob")[, "Yes"],
+  SVM_Linear = predict(model_svm_linear, newdata = test_data, type = "prob")[, "Yes"],
+  Tree = predict(model_tree, newdata = test_data, type = "prob")[, "Yes"],
+  XGBoost = predict(model_xgb, newdata = test_data, type = "prob")[, "Yes"],
+  PLS = predict(model_pls, newdata = test_data, type = "prob")[, "Yes"]
+)
+```
+
+## Score Tables Across Thresholds
+
+```{r score-tables}
+thresholds <- seq(0, 1, by = 0.05)
+score_multiplier <- c(lower = sm$lower, mean = sm$mean, upper = sm$upper)
+
+build_score_table <- function(multiplier) {
+  tibble(threshold = thresholds) %>%
+    mutate(
+      Logistic = map_dbl(threshold, ~get_score(model_probs$Logistic, test_data$target, multiplier, .x)),
+      GLMNet = map_dbl(threshold, ~get_score(model_probs$GLMNet, test_data$target, multiplier, .x)),
+      Lasso = map_dbl(threshold, ~get_score(model_probs$Lasso, test_data$target, multiplier, .x)),
+      Ridge = map_dbl(threshold, ~get_score(model_probs$Ridge, test_data$target, multiplier, .x)),
+      LDA = map_dbl(threshold, ~get_score(model_probs$LDA, test_data$target, multiplier, .x)),
+      QDA = map_dbl(threshold, ~get_score(model_probs$QDA, test_data$target, multiplier, .x)),
+      KNN = map_dbl(threshold, ~get_score(model_probs$KNN, test_data$target, multiplier, .x)),
+      SVM_Linear = map_dbl(threshold, ~get_score(model_probs$SVM_Linear, test_data$target, multiplier, .x)),
+      Tree = map_dbl(threshold, ~get_score(model_probs$Tree, test_data$target, multiplier, .x)),
+      XGBoost = map_dbl(threshold, ~get_score(model_probs$XGBoost, test_data$target, multiplier, .x)),
+      PLS = map_dbl(threshold, ~get_score(model_probs$PLS, test_data$target, multiplier, .x))
+    )
+}
+
+score_tables <- lapply(score_multiplier, build_score_table)
+
+score_tables$mean
+```
+
+## Combined Score Grid
+
+```{r combined-grid}
+combined_df <- purrr::imap_dfr(score_tables, function(df, label) {
+  df %>%
+    pivot_longer(-threshold, names_to = "model", values_to = "units") %>%
+    mutate(odds = score_multiplier[[label]], line = alt_line, edge = label)
+})
+
+combined_df %>%
+  group_by(edge) %>%
+  slice_max(order_by = units, n = 5, with_ties = FALSE) %>%
+  ungroup()
+```
+
+## Export Model Scores
+
+```{r}
+alt_label <- ifelse(
+  alt_line < 0,
+  paste0("neg", abs(alt_line)),
+  as.character(alt_line)
+)
+
+file_name <- paste0("../Model Scores/model_performance_score_", alt_label, ".csv")
+
+# write.csv(combined_df, file_name, row.names = FALSE)
+```
+
+
+## Best Scores per Model
+
+```{r exportable-findings}
+pos_df <- combined_df %>% filter(units > 0)
+
+pos_df %>%
+  group_by(model, edge) %>%
+  summarize(best_units = max(units)) %>%
+  arrange(desc(best_units))
+```
+
+## Variable Importance
+
+```{r variable-importance}
+imp_tree <- varImp(model_tree, 10)
+imp_xgb <- varImp(model_xgb, 10)
+
+ggplot(imp_tree, top = 20) +
+  labs(title = "Decision Tree Feature Importance") +
+  theme_minimal()
+
+ggplot(imp_xgb, top = 20) +
+  labs(title = "XGBoost Feature Importance") +
+  theme_minimal()
+```

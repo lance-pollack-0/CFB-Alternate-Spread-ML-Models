@@ -1,0 +1,87 @@
+---
+title: "Untitled"
+author: "Lance Pollack"
+date: "2024-12-10"
+output: html_document
+---
+
+
+
+```{r}
+library(tidyverse)
+
+score_path <- function(fname) {
+  candidates <- c(
+    fname,
+    file.path("Model Scores", fname),
+    file.path("..", "Model Scores", fname),
+    file.path("..", fname)
+  )
+  existing <- candidates[file.exists(candidates)]
+  if (length(existing) == 0) stop(paste("Place", fname, "in Model Scores/"))
+  existing[1]
+}
+
+df13 <- read.csv(score_path("model_performance_score_13.csv"))
+df7 <- read.csv(score_path("model_performance_score_7.csv"))
+df3 <- read.csv(score_path("model_performance_score_3.csv"))
+df_neg7 <- read.csv(score_path("model_performance_score_neg7.csv"))
+
+round(sort(unique(df13$odds)), 2)
+round(sort(unique(df7$odds)), 2)
+round(sort(unique(df3$odds)), 2)
+round(sort(unique(df_neg7$odds)), 2)
+
+```
+
+```{r}
+df_temp <- df_neg7 %>%
+  mutate(odds_str = 
+         ifelse(odds == min(odds), "lower", 
+               ifelse(odds == max(odds), "upper", "mean"))
+         )
+
+sort(unique(df_temp$odds))
+df_temp %>%
+  group_by(model, odds_str) %>%
+  summarize(max_units = round(max(units), 1)) %>%
+  pivot_wider(names_from = odds_str, values_from = max_units)
+
+```
+
+
+```{r}
+summary(df13)
+summary(df7)
+summary(df3)
+summary(df_neg7)
+```
+
+```{r}
+df <- bind_rows(df13, df7, df3, df_neg7)
+unique(df$line)
+unique(df$model)
+```
+
+```{r}
+df %>% 
+  group_by(model, edge, line) %>%                           # Group data by 'odds'
+  # slice_max(order_by = units, n = 1, with_ties = FALSE) %>%  
+  summarize(max_units = max(units)) %>%
+  arrange(-max_units) %>%
+  ungroup()   
+
+```
+
+
+```{r}
+df %>% arrange(-units)
+
+df_up <- df %>%
+  filter(units > 40)
+for (m in unique(df_up$model)) {
+  print(m)
+  print(sum(df_up$model == m))
+}
+```
+
